@@ -1,0 +1,12 @@
+{
+  "provider": "openai",
+  "openai": {
+    "model": "gpt-5.6-luna",
+    "image_detail": "high",
+    "retries": 1
+  },
+  "local": {
+    "model": "qwen3-vl:8b",
+    "retries": 1
+  }
+}

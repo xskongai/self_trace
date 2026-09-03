@@ -1,3 +1,5 @@
+openai>=2.0.0
 ollama>=0.6.0
 pydantic>=2.7
 tqdm>=4.66
+python-dotenv>=1.0

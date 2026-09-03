@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""SelfTrace batch multimodal analyzer v1.8.
+"""SelfTrace batch analyzer v2.0 with provider switching.
 
-Features
---------
-- analyzes every post in posts_enriched.json;
-- one JSON output per post;
-- resume by default: valid v1.8 outputs for the same model are skipped;
-- failures do not abort the batch;
-- one overall tqdm progress bar plus detailed timestamped log;
-- batch summary JSON records successes/skips/failures and elapsed time;
-- supports --limit for smoke tests and --force for full reruns.
+Examples:
+    # Use config.json (default is OpenAI / gpt-5.6-luna)
+    python scripts/analyze_all_posts.py --limit 3
+
+    # Force local Ollama without editing config.json
+    python scripts/analyze_all_posts.py --provider local --limit 3
+
+Outputs are separated by provider:
+    data/analysis/openai/<post_id>.json
+    data/analysis/local/<post_id>.json
 """
 
 from __future__ import annotations
@@ -17,7 +18,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import sys
 import time
 import traceback
 from datetime import datetime
@@ -25,15 +25,16 @@ from pathlib import Path
 
 from tqdm import tqdm
 
-# Import the reusable pipeline from the sibling script.
 from analyze_post import (
     ANALYSIS_VERSION,
     PROJECT_ROOT,
     SCHEMA_VERSION,
     TqdmLoggingHandler,
     analyze_one_post,
+    load_config,
     load_json,
     resolve_project_path,
+    resolve_provider_settings,
 )
 
 LOGGER = logging.getLogger("selftrace.analyze_all")
@@ -63,8 +64,7 @@ def save_json(obj: dict, path: Path) -> None:
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def output_is_resumable(path: Path, model: str) -> bool:
-    """Skip only a completed output from the same analysis version and model."""
+def output_is_resumable(path: Path, provider: str, model: str) -> bool:
     if not path.exists():
         return False
     try:
@@ -72,21 +72,23 @@ def output_is_resumable(path: Path, model: str) -> bool:
         return (
             obj.get("schema_version") == SCHEMA_VERSION
             and obj.get("analysis_version") == ANALYSIS_VERSION
+            and obj.get("provider") == provider
             and obj.get("model") == model
-            and obj.get("analysis_status") in {"OK", "SKIPPED_EMPTY"}
+            and obj.get("analysis_status") in {"OK", "OK_WITH_WARNINGS", "SKIPPED_EMPTY"}
         )
     except Exception:
         return False
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="SelfTrace batch analyzer v1.8")
+    parser = argparse.ArgumentParser(description="SelfTrace batch analyzer v2.0")
     parser.add_argument("--input", default="data/processed/posts_enriched.json", type=Path)
-    parser.add_argument("--output-dir", default="data/analysis", type=Path)
-    parser.add_argument("--model", default="qwen3-vl:8b")
-    parser.add_argument("--limit", type=int, default=None, help="Analyze only first N selected posts (smoke test)")
-    parser.add_argument("--force", action="store_true", help="Re-run even if a valid v1.8 output already exists")
-    parser.add_argument("--ollama-retries", type=int, default=2)
+    parser.add_argument("--config", default="config.json", type=Path)
+    parser.add_argument("--provider", choices=["openai", "local"], default=None)
+    parser.add_argument("--model", default=None)
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--force", action="store_true")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument("--no-progress", action="store_true")
     return parser.parse_args()
@@ -97,9 +99,14 @@ def main() -> None:
     batch_started = time.perf_counter()
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
+    config = load_config(args.config)
+    provider, model, provider_settings = resolve_provider_settings(config, args.provider, args.model)
+
     input_path = resolve_project_path(args.input)
-    output_dir = resolve_project_path(args.output_dir)
-    log_file = (PROJECT_ROOT / "logs" / f"analyze_all_{timestamp}.log").resolve()
+    output_dir = resolve_project_path(args.output_dir) if args.output_dir else (
+        PROJECT_ROOT / "data" / "analysis" / provider
+    ).resolve()
+    log_file = (PROJECT_ROOT / "logs" / f"analyze_all_{provider}_{timestamp}.log").resolve()
     summary_file = (output_dir / f"batch_summary_{timestamp}.json").resolve()
     setup_batch_logging(log_file, args.log_level)
 
@@ -108,20 +115,22 @@ def main() -> None:
     if args.limit is not None:
         posts = posts[: max(0, args.limit)]
 
-    LOGGER.info("=" * 80)
+    LOGGER.info("=" * 84)
     LOGGER.info("SelfTrace batch analyzer v%s", ANALYSIS_VERSION)
     LOGGER.info("Project root : %s", PROJECT_ROOT)
+    LOGGER.info("Provider     : %s", provider)
+    LOGGER.info("Model        : %s", model)
     LOGGER.info("Input        : %s", input_path)
     LOGGER.info("Output dir   : %s", output_dir)
-    LOGGER.info("Model        : %s", args.model)
     LOGGER.info("Selected     : %d posts", len(posts))
     LOGGER.info("Resume       : %s", not args.force)
     LOGGER.info("Log file     : %s", log_file)
-    LOGGER.info("=" * 80)
+    LOGGER.info("=" * 84)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     results: list[dict] = []
-    counts = {"success": 0, "skipped_existing": 0, "skipped_empty": 0, "failed": 0}
+    counts = {"success": 0, "warnings": 0, "skipped_existing": 0, "skipped_empty": 0, "failed": 0}
+    usage_totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
     progress = tqdm(
         total=len(posts),
@@ -136,42 +145,56 @@ def main() -> None:
             post_id = str(post.get("post_id"))
             output_path = (output_dir / f"{post_id}.json").resolve()
             progress.set_description(f"Post {index}/{len(posts)}")
-            progress.set_postfix(ok=counts["success"], skip=counts["skipped_existing"], fail=counts["failed"])
+            progress.set_postfix(ok=counts["success"], warn=counts["warnings"], fail=counts["failed"])
 
-            if not args.force and output_is_resumable(output_path, args.model):
+            if not args.force and output_is_resumable(output_path, provider, model):
                 counts["skipped_existing"] += 1
                 results.append({"post_id": post_id, "status": "SKIPPED_EXISTING", "output": str(output_path)})
-                LOGGER.info("Skip existing | %d/%d | post=%s | %s", index, len(posts), post_id, output_path)
+                LOGGER.info("Skip existing | %d/%d | post=%s", index, len(posts), post_id)
                 progress.update(1)
                 continue
 
-            LOGGER.info("Post start | %d/%d | post=%s | media=%d", index, len(posts), post_id, len(post.get("media", [])))
+            LOGGER.info(
+                "Post start | %d/%d | post=%s | media=%d | provider=%s | model=%s",
+                index, len(posts), post_id, len(post.get("media", [])), provider, model,
+            )
             started = time.perf_counter()
             try:
                 output = analyze_one_post(
-                    post,
-                    args.model,
-                    output_path,
+                    post=post,
+                    provider=provider,
+                    model=model,
+                    provider_settings=provider_settings,
+                    output_path=output_path,
                     logger=LOGGER,
-                    # Outer bar is clearer in batch mode; detailed stages remain in logs.
                     show_progress=False,
-                    ollama_retries=max(0, args.ollama_retries),
                 )
                 elapsed = time.perf_counter() - started
-                if output.get("analysis_status") == "SKIPPED_EMPTY":
+                status = output.get("analysis_status")
+                if status == "SKIPPED_EMPTY":
                     counts["skipped_empty"] += 1
+                elif status == "OK_WITH_WARNINGS":
+                    counts["warnings"] += 1
                 else:
                     counts["success"] += 1
+
+                usage = output.get("usage") or {}
+                for key in usage_totals:
+                    value = usage.get(key)
+                    if isinstance(value, int):
+                        usage_totals[key] += value
+
                 results.append({
                     "post_id": post_id,
-                    "status": output.get("analysis_status"),
+                    "status": status,
                     "signals": len(output.get("evidence_signals", [])),
                     "elapsed_seconds": round(elapsed, 3),
+                    "usage": usage,
                     "output": str(output_path),
                 })
                 LOGGER.info(
                     "Post done | post=%s | status=%s | signals=%d | %.2fs",
-                    post_id, output.get("analysis_status"), len(output.get("evidence_signals", [])), elapsed,
+                    post_id, status, len(output.get("evidence_signals", [])), elapsed,
                 )
             except Exception as exc:
                 elapsed = time.perf_counter() - started
@@ -187,36 +210,43 @@ def main() -> None:
                 })
 
             progress.update(1)
-            progress.set_postfix(ok=counts["success"], skip=counts["skipped_existing"], fail=counts["failed"])
+            progress.set_postfix(ok=counts["success"], warn=counts["warnings"], fail=counts["failed"])
     finally:
         progress.close()
 
     elapsed_total = time.perf_counter() - batch_started
     summary = {
-        "schema_version": "selftrace-batch-summary-v1.8",
+        "schema_version": "selftrace-batch-summary-v2.0",
         "analysis_version": ANALYSIS_VERSION,
-        "model": args.model,
+        "provider": provider,
+        "model": model,
         "input": str(input_path),
         "output_dir": str(output_dir),
         "started_at": timestamp,
         "selected_posts": len(posts),
         "counts": counts,
+        "usage_totals": usage_totals,
         "elapsed_seconds": round(elapsed_total, 3),
         "results": results,
         "log_file": str(log_file),
     }
     save_json(summary, summary_file)
 
-    LOGGER.info("=" * 80)
+    LOGGER.info("=" * 84)
     LOGGER.info("Batch completed")
     LOGGER.info("Success          : %d", counts["success"])
+    LOGGER.info("Warnings         : %d", counts["warnings"])
     LOGGER.info("Skipped existing : %d", counts["skipped_existing"])
     LOGGER.info("Skipped empty    : %d", counts["skipped_empty"])
     LOGGER.info("Failed           : %d", counts["failed"])
+    if provider == "openai":
+        LOGGER.info("Input tokens     : %d", usage_totals["input_tokens"])
+        LOGGER.info("Output tokens    : %d", usage_totals["output_tokens"])
+        LOGGER.info("Total tokens     : %d", usage_totals["total_tokens"])
     LOGGER.info("Elapsed          : %.2fs", elapsed_total)
     LOGGER.info("Summary          : %s", summary_file)
     LOGGER.info("Detailed log     : %s", log_file)
-    LOGGER.info("=" * 80)
+    LOGGER.info("=" * 84)
 
 
 if __name__ == "__main__":
