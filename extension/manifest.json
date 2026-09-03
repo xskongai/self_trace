@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "SelfTrace V1.1",
+  "version": "0.2.0",
+  "description": "Continuously collect your own loaded X posts while you scroll, locally and without the X API.",
+  "permissions": ["activeTab", "storage", "downloads"],
+  "host_permissions": ["https://x.com/*"],
+  "content_scripts": [
+    {
+      "matches": ["https://x.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "SelfTrace"
+  }
+}
