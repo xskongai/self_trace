@@ -1,0 +1,14 @@
+# Python environments
+.venv/
+local-pipeline/.venv/
+
+# Local data
+local-pipeline/data/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE / macOS
+.idea/
+.DS_Store
